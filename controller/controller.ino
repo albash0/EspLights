@@ -29,6 +29,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 const int ROWS = 4;
 const int COLS = 3;
+const int NAV_ITEMS = 10; // Nine normal cells plus one full-width settings row.
 int cursorRow = 0;
 int cursorCol = 0;
 bool isEditing = false;
@@ -121,6 +122,16 @@ struct ZoneSettings {
 ZoneSettings zones[4];      // 0, 1, 2 = Physical Zones | 3 = Global Control
 int currentZoneIdx = 3;
 bool inCustomColorSubmenu = false;
+bool inSettingsMenu = false;
+uint8_t settingsCursor = 0;
+bool automaticLights = false;
+bool useFahrenheit = true;
+float temperatureOffsetC = 0.0f;
+
+#define TELEMETRY_MAGIC 0xA17C
+#define TELEMETRY_RADAR_CONNECTED 0x01
+#define TELEMETRY_AHT_CONNECTED   0x02
+#define TELEMETRY_PRESENCE        0x04
 
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -135,14 +146,32 @@ struct __attribute__((packed)) ESPNowPacket {
   uint8_t scatter;
   uint8_t rainbowSpeed;
   uint8_t musicSensitivity;
+  uint8_t automaticLights;
+};
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint16_t magic;
+  int16_t temperatureCentiC;
+  uint16_t humidityCentiPct;
+  uint8_t flags;
 };
 
 volatile int encoderDelta = 0;
 volatile unsigned long lastHeartbeatReceived = 0;
+volatile int16_t receivedTemperatureCentiC = 0;
+volatile uint16_t receivedHumidityCentiPct = 0;
+volatile uint8_t receivedTelemetryFlags = 0;
+volatile bool displayDirty = true;
+
+unsigned long lastUserActivity = 0;
+unsigned long lastDisplayRefresh = 0;
+bool lastReceiverConnected = false;
 
 const uint32_t CONFIRM_LONG_PRESS_MS = 700;
 const uint32_t DEBOUNCE_MS = 35;
 const uint32_t BACK_DEBOUNCE_MS = 150;
+const uint32_t DISPLAY_FRAME_INTERVAL_MS = 67;       // At most ~15 FPS.
+const uint32_t AUTO_SLEEP_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 void handleEncoder();
 void applyEncoderStep(int direction);
@@ -158,6 +187,7 @@ void toggleSpecificZone(int zoneIdx);
 void toggleGlobalZones();
 void applyColorChoice(ZoneSettings &z);
 void toggleOffStableMode(ZoneSettings &z);
+void noteUserActivity();
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
@@ -291,6 +321,7 @@ void setup() {
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.setPowerSave(0);
+  lastUserActivity = millis();
 
   broadcastSettings(currentZoneIdx);
 }
@@ -298,8 +329,30 @@ void setup() {
 void loop() {
   handleEncoder();
   handleButtons();
-  updateDisplay();
-  delay(16);
+
+  unsigned long now = millis();
+  bool receiverConnected = now - lastHeartbeatReceived < 5000;
+  if (receiverConnected != lastReceiverConnected) {
+    lastReceiverConnected = receiverConnected;
+    displayDirty = true;
+  }
+
+  if (now - lastUserActivity >= AUTO_SLEEP_TIMEOUT_MS) {
+    enterSleepMode();
+    now = millis();
+  }
+
+  if (displayDirty && now - lastDisplayRefresh >= DISPLAY_FRAME_INTERVAL_MS) {
+    displayDirty = false;
+    lastDisplayRefresh = now;
+    updateDisplay();
+  }
+  delay(5);
+}
+
+void noteUserActivity() {
+  lastUserActivity = millis();
+  displayDirty = true;
 }
 
 void IRAM_ATTR handleEncoderISR() {
@@ -330,6 +383,7 @@ void broadcastSettings(int zoneIdx) {
   packet.scatter = zones[zoneIdx].scatter;
   packet.rainbowSpeed = zones[zoneIdx].rainbowSpeed;
   packet.musicSensitivity = zones[zoneIdx].musicSensitivity;
+  packet.automaticLights = automaticLights ? 1 : 0;
 
   esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
   if (result == ESP_OK) {
@@ -355,17 +409,29 @@ void handleEncoder() {
   accumulatedTicks %= 4;
 
   if (clicks != 0) {
+    noteUserActivity();
     int direction = (clicks > 0) ? 1 : -1;
     int absClicks = abs(clicks);
     for (int i = 0; i < absClicks; i++) {
       applyEncoderStep(direction);
     }
-    broadcastSettings(currentZoneIdx);
+    // Cursor movement and local-only settings do not need an ESP-NOW packet.
+    if (isEditing && !inSettingsMenu) broadcastSettings(currentZoneIdx);
   }
 }
 
 void applyEncoderStep(int direction) {
   ZoneSettings &z = zones[currentZoneIdx];
+
+  if (inSettingsMenu) {
+    if (isEditing && settingsCursor == 2) {
+      float stepC = useFahrenheit ? (0.1f / 1.8f) : 0.1f;
+      temperatureOffsetC = constrain(temperatureOffsetC + (direction * stepC), -10.0f, 10.0f);
+    } else {
+      settingsCursor = constrain((int)settingsCursor + direction, 0, 2);
+    }
+    return;
+  }
 
   if (inCustomColorSubmenu) {
     if (!isEditing) {
@@ -388,12 +454,17 @@ void applyEncoderStep(int direction) {
   }
 
   if (!isEditing) {
-    int linearIndex = cursorRow * COLS + cursorCol;
+    int linearIndex = (cursorRow == 3) ? 9 : (cursorRow * COLS + cursorCol);
     linearIndex += direction;
-    if (linearIndex < 0) linearIndex = (ROWS * COLS) - 1;
-    if (linearIndex >= ROWS * COLS) linearIndex = 0;
-    cursorRow = linearIndex / COLS;
-    cursorCol = linearIndex % COLS;
+    if (linearIndex < 0) linearIndex = NAV_ITEMS - 1;
+    if (linearIndex >= NAV_ITEMS) linearIndex = 0;
+    if (linearIndex == 9) {
+      cursorRow = 3;
+      cursorCol = 0;
+    } else {
+      cursorRow = linearIndex / COLS;
+      cursorCol = linearIndex % COLS;
+    }
   } else {
     if (cursorCol == 0) {
       if (cursorRow == 0) {
@@ -504,6 +575,8 @@ void enterSleepMode() {
     initWireless();
     u8g2.setPowerSave(0);
     lastHeartbeatReceived = millis();
+    lastUserActivity = millis();
+    displayDirty = true;
     Serial.println("System: Woken up!");
     return;
   }
@@ -529,8 +602,22 @@ void handleButtons() {
   if (pshCurr != lastPshState && (now - lastPshChange) > DEBOUNCE_MS) {
     lastPshChange = now;
     if (pshCurr == LOW) {
+      noteUserActivity();
+      if (inSettingsMenu) {
+        if (settingsCursor == 0) {
+          automaticLights = !automaticLights;
+          broadcastSettings(3);
+        } else if (settingsCursor == 1) {
+          useFahrenheit = !useFahrenheit;
+        } else if (settingsCursor == 2) {
+          isEditing = !isEditing;
+        }
+      } else if (!isEditing && cursorRow == 3) {
+        inSettingsMenu = true;
+        settingsCursor = 0;
+      }
       // Open custom color only when the cell currently shows SetClr (mode not RAINBOW/MUSIC)
-      if (!inCustomColorSubmenu &&
+      else if (!inCustomColorSubmenu &&
           !isEditing &&
           cursorRow == 1 &&
           cursorCol == 0 &&
@@ -544,13 +631,14 @@ void handleButtons() {
       } else {
         isEditing = !isEditing;
       }
-      broadcastSettings(currentZoneIdx);
+      if (!inSettingsMenu) broadcastSettings(currentZoneIdx);
     }
     lastPshState = pshCurr;
   }
 
-  if (!inCustomColorSubmenu) {
+  if (!inCustomColorSubmenu && !inSettingsMenu) {
     if (!confirmPressed && confirmCurr == LOW && (now - lastConfirmEdge) > DEBOUNCE_MS) {
+      noteUserActivity();
       confirmPressed = true;
       confirmPressStart = now;
       confirmLongHandled = false;
@@ -558,12 +646,14 @@ void handleButtons() {
     }
 
     if (confirmPressed && confirmCurr == LOW && !confirmLongHandled && (now - confirmPressStart) >= CONFIRM_LONG_PRESS_MS) {
+      noteUserActivity();
       confirmLongHandled = true;
       toggleGlobalZones();
       broadcastSettings(3);
     }
 
     if (confirmPressed && confirmCurr == HIGH && (now - lastConfirmEdge) > DEBOUNCE_MS) {
+      noteUserActivity();
       if (!confirmLongHandled) {
         if (currentZoneIdx < 3) {
           toggleSpecificZone(currentZoneIdx);
@@ -584,7 +674,16 @@ void handleButtons() {
   if (backCurr != lastBackState && (now - lastBackChange) > BACK_DEBOUNCE_MS) {
     lastBackChange = now;
     if (backCurr == LOW) {
-      if (inCustomColorSubmenu) {
+      noteUserActivity();
+      if (inSettingsMenu) {
+        if (isEditing) {
+          isEditing = false;
+        } else {
+          inSettingsMenu = false;
+          cursorRow = 3;
+          cursorCol = 0;
+        }
+      } else if (inCustomColorSubmenu) {
         if (isEditing) {
           isEditing = false;
         } else {
@@ -607,6 +706,41 @@ void handleButtons() {
 void updateDisplay() {
   u8g2.clearBuffer();
   ZoneSettings &z = zones[currentZoneIdx];
+
+  if (inSettingsMenu) {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(2, 10, "Settings");
+
+    char buf[24];
+    for (int row = 0; row < 3; row++) {
+      int y = 21 + (row * 13);
+      if (settingsCursor == row && isEditing) {
+        u8g2.drawBox(0, y - 10, 128, 12);
+        u8g2.setDrawColor(0);
+      } else if (settingsCursor == row) {
+        u8g2.drawFrame(0, y - 10, 128, 12);
+        u8g2.setDrawColor(1);
+      } else {
+        u8g2.setDrawColor(1);
+      }
+      if (row == 0) snprintf(buf, sizeof(buf), "Auto lights: %s", automaticLights ? "ON" : "OFF");
+      else if (row == 1) snprintf(buf, sizeof(buf), "Temperature: %c", useFahrenheit ? 'F' : 'C');
+      else {
+        float displayedOffset = useFahrenheit ? (temperatureOffsetC * 1.8f) : temperatureOffsetC;
+        snprintf(buf, sizeof(buf), "Temp adjust: %+.1f%c", displayedOffset, useFahrenheit ? 'F' : 'C');
+      }
+      u8g2.drawStr(4, y, buf);
+    }
+
+    u8g2.setDrawColor(1);
+    bool telemetryFresh = millis() - lastHeartbeatReceived < 5000;
+    bool radarOk = telemetryFresh && (receivedTelemetryFlags & TELEMETRY_RADAR_CONNECTED);
+    bool ahtOk = telemetryFresh && (receivedTelemetryFlags & TELEMETRY_AHT_CONNECTED);
+    snprintf(buf, sizeof(buf), "Radar:%s AHT:%s", radarOk ? "OK" : "--", ahtOk ? "OK" : "--");
+    u8g2.drawStr(2, 62, buf);
+    u8g2.sendBuffer();
+    return;
+  }
 
   if (inCustomColorSubmenu) {
     u8g2.setFont(u8g2_font_6x10_tf);
@@ -640,7 +774,7 @@ void updateDisplay() {
     return;
   }
 
-  for (int r = 0; r < ROWS; r++) {
+  for (int r = 0; r < 3; r++) {
     for (int c = 0; c < COLS; c++) {
       int x = c * 43;
       int y = (r * 15) + 12;
@@ -656,13 +790,6 @@ void updateDisplay() {
         }
       } else {
         u8g2.setDrawColor(1);
-      }
-
-      // Connection icon cell
-      if (c == 1 && r == 3) {
-        bool isConnected = (millis() - lastHeartbeatReceived < 5000);
-        u8g2.drawXBMP(x + 16, y - 8, 8, 8, isConnected ? ICON_WIFI_CONNECTED : ICON_DISCONNECTED_X);
-        continue;
       }
 
       // Zone icon cell (changes with selected zone)
@@ -686,12 +813,6 @@ void updateDisplay() {
           else if (z.colorChoice == COLOR_CUSTOM) snprintf(buf, sizeof(buf), "[SetClr]");
         }
         if (r == 2) snprintf(buf, sizeof(buf), "%d", z.brightness);
-      } else if (c == 1) {
-        if (r == 3) {
-          bool isConnected = (millis() - lastHeartbeatReceived < 5000);
-          if (isConnected) snprintf(buf, sizeof(buf), "  [CON]");
-          else snprintf(buf, sizeof(buf), "  [DIS]");
-        }
       } else if (c == 2) {
         if (r == 0) snprintf(buf, sizeof(buf), "%s", modeNames[z.mode]);
         if (r == 1) snprintf(buf, sizeof(buf), "On:%u", z.lightCount);
@@ -704,6 +825,26 @@ void updateDisplay() {
       }
     }
   }
+
+  bool connected = millis() - lastHeartbeatReceived < 5000;
+  bool ahtOk = connected && (receivedTelemetryFlags & TELEMETRY_AHT_CONNECTED);
+  bool presence = connected && (receivedTelemetryFlags & TELEMETRY_PRESENCE);
+  if (cursorRow == 3) u8g2.drawFrame(0, 52, 128, 12);
+
+  char telemetry[22];
+  if (ahtOk) {
+    float temperature = (receivedTemperatureCentiC / 100.0f) + temperatureOffsetC;
+    if (useFahrenheit) temperature = (temperature * 9.0f / 5.0f) + 32.0f;
+    snprintf(telemetry, sizeof(telemetry), "%.1f%c %u%% %c%s",
+             temperature, useFahrenheit ? 'F' : 'C',
+             (unsigned)(receivedHumidityCentiPct / 100),
+             presence ? 'P' : '-', automaticLights ? " AUTO" : "");
+  } else {
+    snprintf(telemetry, sizeof(telemetry), "--.-%c --%% %c%s",
+             useFahrenheit ? 'F' : 'C', presence ? 'P' : '-', automaticLights ? " AUTO" : "");
+  }
+  u8g2.drawStr(3, 62, telemetry);
+  u8g2.drawXBMP(118, 54, 8, 8, connected ? ICON_WIFI_CONNECTED : ICON_DISCONNECTED_X);
 
   u8g2.sendBuffer();
 }
@@ -721,7 +862,20 @@ void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingDa
 #else
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 #endif
-  if (len == 1 && incomingData[0] == 0xAB) {
+  if (len == sizeof(TelemetryPacket)) {
+    TelemetryPacket packet;
+    memcpy(&packet, incomingData, sizeof(packet));
+    if (packet.magic != TELEMETRY_MAGIC) return;
+    bool telemetryChanged =
+      receivedTemperatureCentiC != packet.temperatureCentiC ||
+      receivedHumidityCentiPct != packet.humidityCentiPct ||
+      receivedTelemetryFlags != packet.flags;
+    receivedTemperatureCentiC = packet.temperatureCentiC;
+    receivedHumidityCentiPct = packet.humidityCentiPct;
+    receivedTelemetryFlags = packet.flags;
+    lastHeartbeatReceived = millis();
+    if (telemetryChanged) displayDirty = true;
+  } else if (len == 1 && incomingData[0] == 0xAB) {
     lastHeartbeatReceived = millis();
   }
 }

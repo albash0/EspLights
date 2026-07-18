@@ -5,6 +5,8 @@
 #include <esp_wifi.h>
 #include <FastLED.h>
 #include <esp_arduino_version.h>
+#include <Wire.h>
+#include <ld2410.h>
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   #include <driver/i2s_std.h>
@@ -27,6 +29,18 @@
 #define I2S_SD          20
 #define I2S_LR          21   // adjust to wiring: LOW=left, HIGH=right
 
+// Optional environmental/presence sensors. Change these four pins to match wiring.
+#define RADAR_RX_PIN    4    // ESP32 RX <- LD2410C TX
+#define RADAR_TX_PIN    6    // ESP32 TX -> LD2410C RX
+#define AHT_SDA_PIN     8
+#define AHT_SCL_PIN     9
+#define AHT10_ADDRESS   0x38
+
+#define TELEMETRY_MAGIC 0xA17C
+#define TELEMETRY_RADAR_CONNECTED 0x01
+#define TELEMETRY_AHT_CONNECTED   0x02
+#define TELEMETRY_PRESENCE        0x04
+
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 
 struct ZoneSettings {
@@ -46,6 +60,14 @@ struct __attribute__((packed)) ESPNowPacket {
   uint8_t targetZone; uint8_t r; uint8_t g; uint8_t b;
   uint8_t brightness; uint8_t mode; uint16_t lightCount; uint8_t scatter;
   uint8_t rainbowSpeed; uint8_t musicSensitivity;
+  uint8_t automaticLights;
+};
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint16_t magic;
+  int16_t temperatureCentiC;
+  uint16_t humidityCentiPct;
+  uint8_t flags;
 };
 
 CRGB leds[TOTAL_LEDS];
@@ -54,6 +76,18 @@ float micEnvelope = 0.0f;
 float micNoiseFloor = 0.0f;
 bool micPresent = true;
 uint8_t zoneFade[NUM_ZONES] = {0, 0, 0};
+ld2410 radar;
+bool radarConnected = false;
+bool presenceDetected = false;
+bool ahtConnected = false;
+bool automaticLights = false;
+float temperatureC = 0.0f;
+float humidityPct = 0.0f;
+const uint32_t RADAR_BAUD_RATES[] = {256000, 115200, 57600, 38400, 19200, 9600};
+uint8_t radarBaudIndex = 0;
+uint32_t lastRadarFrameMs = 0;
+uint32_t lastRadarBaudChangeMs = 0;
+uint32_t radarBytesSeen = 0;
 
 #if USE_NEW_I2S
 i2s_chan_handle_t rx_chan = NULL;
@@ -62,6 +96,11 @@ i2s_chan_handle_t rx_chan = NULL;
 void initI2S();
 void readMic();
 void renderLEDs();
+void initOptionalSensors();
+void updateOptionalSensors();
+bool initAHT10();
+bool readAHT10(float &temperature, float &humidity);
+void sendTelemetry();
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingData, int len) {
@@ -70,6 +109,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 #endif
   if (len < sizeof(ESPNowPacket)) return;
   ESPNowPacket packet; memcpy(&packet, incomingData, sizeof(ESPNowPacket));
+  automaticLights = packet.automaticLights != 0;
   
   if (packet.targetZone <= 2) {
     zones[packet.targetZone].r = packet.r;
@@ -106,6 +146,7 @@ void setup() {
   Serial.printf("Mic channel select (L/R pin) = %s\n", digitalRead(I2S_LR) == LOW ? "LEFT" : "RIGHT");
 
   initI2S();
+  initOptionalSensors();
 
   FastLED.addLeds<LED_CHIPSET, LED_PIN, LED_COLOR_ORDER>(leds, TOTAL_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setMaxPowerInVoltsAndMilliamps(12, 2000);
@@ -122,15 +163,115 @@ void setup() {
 }
 
 void loop() {
+  updateOptionalSensors();
   readMic();
   renderLEDs();
   
   static unsigned long lastHeartbeat = 0;
   if (millis() - lastHeartbeat > 2000) {
     lastHeartbeat = millis();
-    uint8_t hb = 0xAB;
-    esp_now_send(broadcastAddress, &hb, 1);
+    sendTelemetry();
   }
+}
+
+void initOptionalSensors() {
+  Wire.begin(AHT_SDA_PIN, AHT_SCL_PIN);
+  Wire.setClock(100000);
+  ahtConnected = initAHT10();
+  Serial.printf("AHT10: %s\n", ahtConnected ? "connected" : "not detected (continuing)");
+
+  Serial1.begin(RADAR_BAUD_RATES[radarBaudIndex], SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+  radar.begin(Serial1, false); // Do not wait or fail boot when the radar is absent.
+  delay(20);
+  radar.read();
+  radarConnected = radar.isConnected();
+  Serial.printf("LD2410C: %s\n", radarConnected ? "connected" : "not detected (continuing)");
+}
+
+bool initAHT10() {
+  Wire.beginTransmission(AHT10_ADDRESS);
+  if (Wire.endTransmission() != 0) return false;
+
+  const uint8_t initCommand[] = {0xBE, 0x08, 0x00};
+  Wire.beginTransmission(AHT10_ADDRESS);
+  Wire.write(initCommand, sizeof(initCommand));
+  if (Wire.endTransmission() != 0) return false;
+  delay(10);
+  return true;
+}
+
+bool readAHT10(float &temperature, float &humidity) {
+  const uint8_t measureCommand[] = {0xAC, 0x33, 0x00};
+  Wire.beginTransmission(AHT10_ADDRESS);
+  Wire.write(measureCommand, sizeof(measureCommand));
+  if (Wire.endTransmission() != 0) return false;
+  delay(85);
+
+  if (Wire.requestFrom((uint8_t)AHT10_ADDRESS, (uint8_t)6) != 6) return false;
+  uint8_t data[6];
+  for (uint8_t i = 0; i < sizeof(data); i++) data[i] = Wire.read();
+  if (data[0] & 0x80) return false;
+
+  uint32_t rawHumidity = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
+  uint32_t rawTemperature = ((uint32_t)(data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
+  humidity = constrain((rawHumidity * 100.0f) / 1048576.0f, 0.0f, 100.0f);
+  temperature = ((rawTemperature * 200.0f) / 1048576.0f) - 50.0f;
+  return true;
+}
+
+void updateOptionalSensors() {
+  radarBytesSeen += Serial1.available();
+  radar.read();
+  static unsigned long lastAhtRead = 0;
+  static unsigned long lastAhtProbe = 0;
+  static unsigned long lastSensorPrint = 0;
+  unsigned long now = millis();
+
+  if (radar.isConnected()) {
+    lastRadarFrameMs = now;
+    radarConnected = true;
+    presenceDetected = radar.presenceDetected();
+  } else if (now - lastRadarFrameMs > 3000) {
+    radarConnected = false;
+    presenceDetected = false;
+    if (now - lastRadarBaudChangeMs > 1500) {
+      lastRadarBaudChangeMs = now;
+      radarBaudIndex = (radarBaudIndex + 1) % (sizeof(RADAR_BAUD_RATES) / sizeof(RADAR_BAUD_RATES[0]));
+      Serial1.updateBaudRate(RADAR_BAUD_RATES[radarBaudIndex]);
+      Serial.printf("LD2410C: trying %lu baud on RX=%d TX=%d\n",
+                    (unsigned long)RADAR_BAUD_RATES[radarBaudIndex], RADAR_RX_PIN, RADAR_TX_PIN);
+    }
+  }
+
+  if (!ahtConnected && now - lastAhtProbe >= 10000) {
+    lastAhtProbe = now;
+    ahtConnected = initAHT10();
+  }
+
+  if (ahtConnected && now - lastAhtRead >= 2000) {
+    lastAhtRead = now;
+    if (!readAHT10(temperatureC, humidityPct)) ahtConnected = false;
+  }
+
+  if (now - lastSensorPrint >= 2000) {
+    lastSensorPrint = now;
+    Serial.printf("SENSORS radar=%s presence=%s baud=%lu uartBytes=%lu AHT=%s temp=%.2fC humidity=%.2f%%\n",
+                  radarConnected ? "OK" : "--", presenceDetected ? "YES" : "NO",
+                  (unsigned long)RADAR_BAUD_RATES[radarBaudIndex],
+                  (unsigned long)radarBytesSeen,
+                  ahtConnected ? "OK" : "--", temperatureC, humidityPct);
+  }
+}
+
+void sendTelemetry() {
+  TelemetryPacket packet = {};
+  packet.magic = TELEMETRY_MAGIC;
+  packet.temperatureCentiC = ahtConnected ? (int16_t)roundf(temperatureC * 100.0f) : 0;
+  packet.humidityCentiPct = ahtConnected ? (uint16_t)roundf(humidityPct * 100.0f) : 0;
+  if (radarConnected) packet.flags |= TELEMETRY_RADAR_CONNECTED;
+  if (ahtConnected) packet.flags |= TELEMETRY_AHT_CONNECTED;
+  if (presenceDetected) packet.flags |= TELEMETRY_PRESENCE;
+  esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
 }
 
 void initI2S() {
@@ -252,6 +393,8 @@ void renderLEDs() {
   static uint8_t hue = 0;
   static unsigned long lastHueMs = 0;
   unsigned long now = millis();
+  // A missing/disconnected radar never suppresses the lights.
+  bool automaticOff = automaticLights && radarConnected && !presenceDetected;
 
   // Compute an average rainbow speed across zones that are in RAINBOW mode.
   uint32_t sumSpeed = 0;
@@ -274,7 +417,7 @@ void renderLEDs() {
   for (int z = 0; z < NUM_ZONES; z++) {
     ZoneSettings &s = zones[z];
 
-    if (s.mode == OFF) {
+    if (s.mode == OFF || automaticOff) {
       zoneFade[z] = qsub8(zoneFade[z], 18);
       continue;
     }
