@@ -97,8 +97,18 @@ uint32_t lastRadarBaudChangeMs = 0;
 uint32_t radarBytesSeen = 0;
 uint32_t telemetrySessionId = 0;
 uint32_t nextTelemetrySequence = 1;
-uint32_t commandSessionId = 0;
-uint32_t lastCommandSequence = 0;
+
+struct ControllerReplayState {
+  uint32_t sessionId;
+  uint32_t lastSequence;
+};
+
+static_assert(CONTROLLER_PEER_COUNT > 0, "Configure at least one controller peer.");
+static_assert(
+  CONTROLLER_PEER_COUNT <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
+  "Too many encrypted controllers for this ESP-NOW build."
+);
+ControllerReplayState controllerReplayStates[CONTROLLER_PEER_COUNT] = {};
 
 #if USE_NEW_I2S
 i2s_chan_handle_t rx_chan = NULL;
@@ -113,26 +123,38 @@ bool initAHT10();
 bool readAHT10(float &temperature, float &humidity);
 void sendTelemetry();
 uint32_t newSessionId();
+int findControllerPeer(const uint8_t *address);
+
+int findControllerPeer(const uint8_t *address) {
+  if (address == nullptr) return -1;
+  for (size_t i = 0; i < CONTROLLER_PEER_COUNT; i++) {
+    if (memcmp(address, CONTROLLER_PEERS[i].address, 6) == 0) return (int)i;
+  }
+  return -1;
+}
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingData, int len) {
-  if (recv_info == nullptr || memcmp(recv_info->src_addr, CONTROLLER_ADDRESS, 6) != 0) return;
+  const uint8_t *sourceAddress = recv_info == nullptr ? nullptr : recv_info->src_addr;
 #else
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  if (mac == nullptr || memcmp(mac, CONTROLLER_ADDRESS, 6) != 0) return;
+  const uint8_t *sourceAddress = mac;
 #endif
+  int controllerIndex = findControllerPeer(sourceAddress);
+  if (controllerIndex < 0) return;
   if (len != sizeof(ESPNowPacket)) return;
   ESPNowPacket packet; memcpy(&packet, incomingData, sizeof(ESPNowPacket));
   if (packet.magic != COMMAND_MAGIC || packet.sessionId == 0) return;
-  if (packet.sessionId != commandSessionId) {
-    commandSessionId = packet.sessionId;
-    lastCommandSequence = 0;
+  ControllerReplayState &replay = controllerReplayStates[controllerIndex];
+  if (packet.sessionId != replay.sessionId) {
+    replay.sessionId = packet.sessionId;
+    replay.lastSequence = 0;
   }
-  if (packet.sequence == 0 || packet.sequence <= lastCommandSequence) {
-    Serial.println("Dropped duplicate/replayed controller packet.");
+  if (packet.sequence == 0 || packet.sequence <= replay.lastSequence) {
+    Serial.printf("Dropped duplicate/replayed packet from controller %d.\n", controllerIndex + 1);
     return;
   }
-  lastCommandSequence = packet.sequence;
+  replay.lastSequence = packet.sequence;
   automaticLights = packet.automaticLights != 0;
 
   if (packet.targetZone <= 2) {
@@ -186,15 +208,18 @@ void setup() {
     }
     esp_now_register_recv_cb(OnDataRecv);
 
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, CONTROLLER_ADDRESS, 6);
-    peerInfo.channel = 1;
-    peerInfo.ifidx = WIFI_IF_STA;
-    peerInfo.encrypt = true;
-    memcpy(peerInfo.lmk, ESPNOW_LMK, sizeof(ESPNOW_LMK));
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to register encrypted controller peer!");
+    for (size_t i = 0; i < CONTROLLER_PEER_COUNT; i++) {
+      esp_now_peer_info_t peerInfo = {};
+      memcpy(peerInfo.peer_addr, CONTROLLER_PEERS[i].address, 6);
+      peerInfo.channel = 1;
+      peerInfo.ifidx = WIFI_IF_STA;
+      peerInfo.encrypt = true;
+      memcpy(peerInfo.lmk, CONTROLLER_PEERS[i].lmk, sizeof(peerInfo.lmk));
+      if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.printf("Failed to register encrypted controller peer %u!\n", (unsigned)(i + 1));
+      }
     }
+    Serial.printf("Configured %u encrypted controller peer(s).\n", (unsigned)CONTROLLER_PEER_COUNT);
   }
 }
 
@@ -319,7 +344,9 @@ void sendTelemetry() {
   if (radarConnected) packet.flags |= TELEMETRY_RADAR_CONNECTED;
   if (ahtConnected) packet.flags |= TELEMETRY_AHT_CONNECTED;
   if (presenceDetected) packet.flags |= TELEMETRY_PRESENCE;
-  esp_now_send(CONTROLLER_ADDRESS, (uint8_t *)&packet, sizeof(packet));
+  for (size_t i = 0; i < CONTROLLER_PEER_COUNT; i++) {
+    esp_now_send(CONTROLLER_PEERS[i].address, (uint8_t *)&packet, sizeof(packet));
+  }
 }
 
 void initI2S() {
