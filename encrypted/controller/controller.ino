@@ -86,6 +86,8 @@ static const uint8_t ICON_MENU[] PROGMEM = {
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 const char* modeNames[] = {"Off", "Stable", "Rainbow", "Breath", "Music"};
+enum ReceiverTarget : uint8_t { RECEIVER_A = 0, RECEIVER_L = 1, RECEIVER_BOTH = 2 };
+const char* receiverNames[] = {"A", "L", "BOTH"};
 enum ColorChoice {
   COLOR_RED,
   COLOR_GREEN,
@@ -129,6 +131,7 @@ uint8_t settingsCursor = 0;
 bool automaticLights = false;
 bool useFahrenheit = true;
 float temperatureOffsetC = 0.0f;
+ReceiverTarget currentReceiverTarget = RECEIVER_A;
 
 #define COMMAND_MAGIC 0xC041
 #define TELEMETRY_MAGIC 0xA17C
@@ -140,6 +143,7 @@ struct __attribute__((packed)) ESPNowPacket {
   uint16_t magic;
   uint32_t sessionId;
   uint32_t sequence;
+  uint8_t targetReceiver;
   uint8_t targetZone;
   uint8_t r;
   uint8_t g;
@@ -177,6 +181,12 @@ uint32_t nextCommandSequence = 1;
 uint32_t telemetrySessionId = 0;
 uint32_t lastTelemetrySequence = 0;
 
+static_assert(RECEIVER_PEER_COUNT > 0, "Configure at least receiver A.");
+static_assert(
+  RECEIVER_PEER_COUNT <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
+  "Too many encrypted receivers for this ESP-NOW build."
+);
+
 const uint32_t CONFIRM_LONG_PRESS_MS = 700;
 const uint32_t DEBOUNCE_MS = 35;
 const uint32_t BACK_DEBOUNCE_MS = 150;
@@ -199,6 +209,7 @@ void applyColorChoice(ZoneSettings &z);
 void toggleOffStableMode(ZoneSettings &z);
 void noteUserActivity();
 uint32_t newSessionId();
+const ReceiverPeerConfig* findReceiverPeer(uint8_t receiverId);
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
@@ -298,17 +309,24 @@ void initWireless() {
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
 
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, RECEIVER_ADDRESS, 6);
-  peerInfo.channel = 1;
-  peerInfo.ifidx = WIFI_IF_STA;
-  peerInfo.encrypt = true;
-  memcpy(peerInfo.lmk, ESPNOW_LMK, sizeof(ESPNOW_LMK));
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to register encrypted receiver peer!");
+  for (size_t i = 0; i < RECEIVER_PEER_COUNT; i++) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, RECEIVER_PEERS[i].address, 6);
+    peerInfo.channel = 1;
+    peerInfo.ifidx = WIFI_IF_STA;
+    peerInfo.encrypt = true;
+    memcpy(peerInfo.lmk, RECEIVER_PEERS[i].lmk, sizeof(peerInfo.lmk));
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.printf("Failed to register encrypted receiver %u!\n", RECEIVER_PEERS[i].receiverId);
+    }
   }
+}
+
+const ReceiverPeerConfig* findReceiverPeer(uint8_t receiverId) {
+  for (size_t i = 0; i < RECEIVER_PEER_COUNT; i++) {
+    if (RECEIVER_PEERS[i].receiverId == receiverId) return &RECEIVER_PEERS[i];
+  }
+  return nullptr;
 }
 
 uint32_t newSessionId() {
@@ -401,6 +419,7 @@ void broadcastSettings(int zoneIdx) {
   packet.magic = COMMAND_MAGIC;
   packet.sessionId = commandSessionId;
   packet.sequence = nextCommandSequence++;
+  packet.targetReceiver = (uint8_t)currentReceiverTarget;
   if (nextCommandSequence == 0) {
     commandSessionId = newSessionId();
     nextCommandSequence = 1;
@@ -417,11 +436,17 @@ void broadcastSettings(int zoneIdx) {
   packet.musicSensitivity = zones[zoneIdx].musicSensitivity;
   packet.automaticLights = automaticLights ? 1 : 0;
 
-  esp_err_t result = esp_now_send(RECEIVER_ADDRESS, (uint8_t *)&packet, sizeof(packet));
-  if (result == ESP_OK) {
-    Serial.printf("Transmitted settings for Zone %d.\n", zoneIdx);
+  bool sent = false;
+  for (size_t i = 0; i < RECEIVER_PEER_COUNT; i++) {
+    uint8_t id = RECEIVER_PEERS[i].receiverId;
+    if (currentReceiverTarget != RECEIVER_BOTH && id != (uint8_t)currentReceiverTarget) continue;
+    esp_err_t result = esp_now_send(RECEIVER_PEERS[i].address, (uint8_t *)&packet, sizeof(packet));
+    sent = sent || result == ESP_OK;
+  }
+  if (sent) {
+    Serial.printf("Transmitted Zone %d settings to %s.\n", zoneIdx, receiverNames[currentReceiverTarget]);
   } else {
-    Serial.println("Error transmitting settings!");
+    Serial.printf("No configured receiver for %s.\n", receiverNames[currentReceiverTarget]);
   }
 }
 
@@ -525,6 +550,11 @@ void applyEncoderStep(int direction) {
         } else if (prevZone != 3) {
           syncGlobalToPhysical();
         }
+      } else if (cursorRow == 2) {
+        int nextReceiver = (int)currentReceiverTarget + direction;
+        if (nextReceiver < RECEIVER_A) nextReceiver = RECEIVER_BOTH;
+        if (nextReceiver > RECEIVER_BOTH) nextReceiver = RECEIVER_A;
+        currentReceiverTarget = (ReceiverTarget)nextReceiver;
       }
     } else if (cursorCol == 2) {
       if (cursorRow == 0) {
@@ -638,7 +668,10 @@ void handleButtons() {
       if (inSettingsMenu) {
         if (settingsCursor == 0) {
           automaticLights = !automaticLights;
+          ReceiverTarget previousTarget = currentReceiverTarget;
+          currentReceiverTarget = RECEIVER_A;
           broadcastSettings(3);
+          currentReceiverTarget = previousTarget;
         } else if (settingsCursor == 1) {
           useFahrenheit = !useFahrenheit;
         } else if (settingsCursor == 2) {
@@ -845,6 +878,8 @@ void updateDisplay() {
           else if (z.colorChoice == COLOR_CUSTOM) snprintf(buf, sizeof(buf), "[SetClr]");
         }
         if (r == 2) snprintf(buf, sizeof(buf), "%d", z.brightness);
+      } else if (c == 1) {
+        if (r == 2) snprintf(buf, sizeof(buf), "%s", receiverNames[currentReceiverTarget]);
       } else if (c == 2) {
         if (r == 0) snprintf(buf, sizeof(buf), "%s", modeNames[z.mode]);
         if (r == 1) snprintf(buf, sizeof(buf), "On:%u", z.lightCount);
@@ -891,10 +926,12 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingData, int len) {
-  if (recv_info == nullptr || memcmp(recv_info->src_addr, RECEIVER_ADDRESS, 6) != 0) return;
+  const ReceiverPeerConfig *primary = findReceiverPeer(RECEIVER_A);
+  if (primary == nullptr || recv_info == nullptr || memcmp(recv_info->src_addr, primary->address, 6) != 0) return;
 #else
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  if (mac == nullptr || memcmp(mac, RECEIVER_ADDRESS, 6) != 0) return;
+  const ReceiverPeerConfig *primary = findReceiverPeer(RECEIVER_A);
+  if (primary == nullptr || mac == nullptr || memcmp(mac, primary->address, 6) != 0) return;
 #endif
   if (len == sizeof(TelemetryPacket)) {
     TelemetryPacket packet;

@@ -84,6 +84,8 @@ static const uint8_t ICON_MENU[] PROGMEM = {
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 const char* modeNames[] = {"Off", "Stable", "Rainbow", "Breath", "Music"};
+enum ReceiverTarget : uint8_t { RECEIVER_A = 0, RECEIVER_L = 1, RECEIVER_BOTH = 2 };
+const char* receiverNames[] = {"A", "L", "BOTH"};
 enum ColorChoice {
   COLOR_RED,
   COLOR_GREEN,
@@ -127,6 +129,7 @@ uint8_t settingsCursor = 0;
 bool automaticLights = false;
 bool useFahrenheit = true;
 float temperatureOffsetC = 0.0f;
+ReceiverTarget currentReceiverTarget = RECEIVER_A;
 
 #define TELEMETRY_MAGIC 0xA17C
 #define TELEMETRY_RADAR_CONNECTED 0x01
@@ -136,6 +139,7 @@ float temperatureOffsetC = 0.0f;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 struct __attribute__((packed)) ESPNowPacket {
+  uint8_t targetReceiver;
   uint8_t targetZone;
   uint8_t r;
   uint8_t g;
@@ -373,6 +377,7 @@ void IRAM_ATTR handleEncoderISR() {
 
 void broadcastSettings(int zoneIdx) {
   ESPNowPacket packet;
+  packet.targetReceiver = (uint8_t)currentReceiverTarget;
   packet.targetZone = zoneIdx;
   packet.r = zones[zoneIdx].r;
   packet.g = zones[zoneIdx].g;
@@ -493,6 +498,11 @@ void applyEncoderStep(int direction) {
         } else if (prevZone != 3) {
           syncGlobalToPhysical();
         }
+      } else if (cursorRow == 2) {
+        int nextReceiver = (int)currentReceiverTarget + direction;
+        if (nextReceiver < RECEIVER_A) nextReceiver = RECEIVER_BOTH;
+        if (nextReceiver > RECEIVER_BOTH) nextReceiver = RECEIVER_A;
+        currentReceiverTarget = (ReceiverTarget)nextReceiver;
       }
     } else if (cursorCol == 2) {
       if (cursorRow == 0) {
@@ -606,7 +616,10 @@ void handleButtons() {
       if (inSettingsMenu) {
         if (settingsCursor == 0) {
           automaticLights = !automaticLights;
+          ReceiverTarget previousTarget = currentReceiverTarget;
+          currentReceiverTarget = RECEIVER_A;
           broadcastSettings(3);
+          currentReceiverTarget = previousTarget;
         } else if (settingsCursor == 1) {
           useFahrenheit = !useFahrenheit;
         } else if (settingsCursor == 2) {
@@ -813,6 +826,8 @@ void updateDisplay() {
           else if (z.colorChoice == COLOR_CUSTOM) snprintf(buf, sizeof(buf), "[SetClr]");
         }
         if (r == 2) snprintf(buf, sizeof(buf), "%d", z.brightness);
+      } else if (c == 1) {
+        if (r == 2) snprintf(buf, sizeof(buf), "%s", receiverNames[currentReceiverTarget]);
       } else if (c == 2) {
         if (r == 0) snprintf(buf, sizeof(buf), "%s", modeNames[z.mode]);
         if (r == 1) snprintf(buf, sizeof(buf), "On:%u", z.lightCount);

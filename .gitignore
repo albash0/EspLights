@@ -1,2 +1,3 @@
 encrypted/controller/secrets.h
 encrypted/receiver/secrets.h
+encrypted/light_receiver/secrets.h

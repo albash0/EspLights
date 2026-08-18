@@ -43,6 +43,9 @@
 #define TELEMETRY_RADAR_CONNECTED 0x01
 #define TELEMETRY_AHT_CONNECTED   0x02
 #define TELEMETRY_PRESENCE        0x04
+#define RECEIVER_A 0
+#define RECEIVER_L 1
+#define RECEIVER_BOTH 2
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 
@@ -62,6 +65,7 @@ struct __attribute__((packed)) ESPNowPacket {
   uint16_t magic;
   uint32_t sessionId;
   uint32_t sequence;
+  uint8_t targetReceiver;
   uint8_t targetZone; uint8_t r; uint8_t g; uint8_t b;
   uint8_t brightness; uint8_t mode; uint16_t lightCount; uint8_t scatter;
   uint8_t rainbowSpeed; uint8_t musicSensitivity;
@@ -145,6 +149,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   if (len != sizeof(ESPNowPacket)) return;
   ESPNowPacket packet; memcpy(&packet, incomingData, sizeof(ESPNowPacket));
   if (packet.magic != COMMAND_MAGIC || packet.sessionId == 0) return;
+  if (packet.targetReceiver != RECEIVER_A && packet.targetReceiver != RECEIVER_BOTH) return;
   ControllerReplayState &replay = controllerReplayStates[controllerIndex];
   if (packet.sessionId != replay.sessionId) {
     replay.sessionId = packet.sessionId;
