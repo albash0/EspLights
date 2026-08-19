@@ -17,9 +17,19 @@
 #define LED_COLOR_ORDER RGB
 
 #define COMMAND_MAGIC   0xC041
+#define MUSIC_LINK_MAGIC 0xE35A
+#define MUSIC_LINK_REQUEST 1
+#define MUSIC_LINK_LEVEL 2
+#define MUSIC_LINK_MIC_PRESENT 0x01
+#define MUSIC_REQUEST_INTERVAL_MS 1500
+#define MUSIC_LEVEL_TIMEOUT_MS 500
 #define RECEIVER_A      0
 #define RECEIVER_L      1
 #define RECEIVER_BOTH   2
+
+#ifndef RECEIVER_LINK_CONFIGURED
+  #define RECEIVER_LINK_CONFIGURED 0
+#endif
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 
@@ -53,21 +63,88 @@ struct __attribute__((packed)) ESPNowPacket {
   uint8_t automaticLights;
 };
 
+struct __attribute__((packed)) MusicLinkPacket {
+  uint16_t magic;
+  uint32_t sessionId;
+  uint32_t sequence;
+  uint8_t messageType;
+  uint8_t value;
+  uint8_t flags;
+};
+
 struct ControllerReplayState {
+  uint32_t sessionId;
+  uint32_t lastSequence;
+};
+
+struct MusicReplayState {
   uint32_t sessionId;
   uint32_t lastSequence;
 };
 
 static_assert(CONTROLLER_PEER_COUNT > 0, "Configure at least one controller peer.");
 static_assert(
-  CONTROLLER_PEER_COUNT <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
-  "Too many encrypted controllers for this ESP-NOW build."
+  CONTROLLER_PEER_COUNT + RECEIVER_LINK_CONFIGURED <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
+  "Too many encrypted controller/receiver peers for this ESP-NOW build."
 );
 
 ZoneSettings zones[NUM_ZONES];
 CRGB leds[TOTAL_LEDS];
 uint8_t zoneFade[NUM_ZONES] = {0, 0, 0};
 ControllerReplayState controllerReplayStates[CONTROLLER_PEER_COUNT] = {};
+MusicReplayState primaryReceiverReplayState = {};
+uint32_t musicSessionId = 0;
+uint32_t nextMusicRequestSequence = 1;
+volatile bool musicRequested = false;
+volatile bool musicRequestDirty = false;
+volatile uint8_t receivedMusicLevel = 0;
+volatile bool receivedMicPresent = false;
+volatile uint32_t lastMusicLevelMs = 0;
+
+uint32_t newSessionId() {
+  uint32_t id = 0;
+  while (id == 0) id = esp_random();
+  return id;
+}
+
+bool anyZoneUsesMusic() {
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].mode == MUSIC) return true;
+  }
+  return false;
+}
+
+void updateMusicRequestState() {
+  bool requested = anyZoneUsesMusic();
+  if (requested != musicRequested) {
+    musicRequested = requested;
+    musicRequestDirty = true;
+  }
+}
+
+void serviceMusicRequest() {
+#if RECEIVER_LINK_CONFIGURED
+  uint32_t now = millis();
+  bool sendNow = musicRequestDirty;
+  if (sendNow) musicRequestDirty = false;
+
+  static uint32_t lastRequestMs = 0;
+  if (!sendNow && (!musicRequested || now - lastRequestMs < MUSIC_REQUEST_INTERVAL_MS)) return;
+  lastRequestMs = now;
+
+  MusicLinkPacket packet = {};
+  packet.magic = MUSIC_LINK_MAGIC;
+  packet.sessionId = musicSessionId;
+  packet.sequence = nextMusicRequestSequence++;
+  packet.messageType = MUSIC_LINK_REQUEST;
+  packet.value = musicRequested ? 1 : 0;
+  if (nextMusicRequestSequence == 0) {
+    musicSessionId = newSessionId();
+    nextMusicRequestSequence = 1;
+  }
+  esp_now_send(PRIMARY_RECEIVER_ADDRESS, (uint8_t *)&packet, sizeof(packet));
+#endif
+}
 
 int findControllerPeer(const uint8_t *address) {
   if (address == nullptr) return -1;
@@ -97,6 +174,7 @@ void applyPacket(const ESPNowPacket &packet) {
   } else if (packet.targetZone == NUM_ZONES) {
     for (int i = 0; i < NUM_ZONES; i++) applyToZone(zones[i]);
   }
+  updateMusicRequestState();
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -106,6 +184,31 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   const uint8_t *sourceAddress = mac;
 #endif
+#if RECEIVER_LINK_CONFIGURED
+  if (sourceAddress != nullptr && memcmp(sourceAddress, PRIMARY_RECEIVER_ADDRESS, 6) == 0) {
+    if (len != sizeof(MusicLinkPacket)) return;
+    MusicLinkPacket packet;
+    memcpy(&packet, incomingData, sizeof(packet));
+    if (packet.magic != MUSIC_LINK_MAGIC ||
+        packet.messageType != MUSIC_LINK_LEVEL ||
+        packet.sessionId == 0) return;
+
+    if (packet.sessionId != primaryReceiverReplayState.sessionId) {
+      primaryReceiverReplayState.sessionId = packet.sessionId;
+      primaryReceiverReplayState.lastSequence = 0;
+    }
+    if (packet.sequence == 0 || packet.sequence <= primaryReceiverReplayState.lastSequence) {
+      Serial.println("Dropped duplicate/replayed music level from receiver A.");
+      return;
+    }
+    primaryReceiverReplayState.lastSequence = packet.sequence;
+    receivedMusicLevel = packet.value;
+    receivedMicPresent = (packet.flags & MUSIC_LINK_MIC_PRESENT) != 0;
+    lastMusicLevelMs = millis();
+    return;
+  }
+#endif
+
   int controllerIndex = findControllerPeer(sourceAddress);
   if (controllerIndex < 0 || len != sizeof(ESPNowPacket)) return;
 
@@ -131,6 +234,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("Booting encrypted light-only receiver L...");
+  musicSessionId = newSessionId();
 
   FastLED.addLeds<LED_CHIPSET, LED_PIN, LED_COLOR_ORDER>(leds, TOTAL_LEDS)
     .setCorrection(TypicalLEDStrip);
@@ -162,12 +266,31 @@ void setup() {
       Serial.printf("Failed to register controller %u.\n", (unsigned)(i + 1));
     }
   }
+#if RECEIVER_LINK_CONFIGURED
+  esp_now_peer_info_t primaryReceiverPeer = {};
+  memcpy(primaryReceiverPeer.peer_addr, PRIMARY_RECEIVER_ADDRESS, 6);
+  primaryReceiverPeer.channel = 1;
+  primaryReceiverPeer.ifidx = WIFI_IF_STA;
+  primaryReceiverPeer.encrypt = true;
+  memcpy(primaryReceiverPeer.lmk, RECEIVER_LINK_LMK, sizeof(primaryReceiverPeer.lmk));
+  if (esp_now_add_peer(&primaryReceiverPeer) != ESP_OK) {
+    Serial.println("Failed to register encrypted receiver A music peer.");
+  } else {
+    Serial.println("Receiver A-to-L encrypted music link enabled.");
+  }
+#else
+  Serial.println("Receiver A-to-L music link not configured; Music will use fallback pulse.");
+#endif
 }
 
 void loop() {
   static uint8_t hue = 0;
   static unsigned long lastHueMs = 0;
   unsigned long now = millis();
+  serviceMusicRequest();
+
+  uint8_t remoteMusicLevel = receivedMusicLevel;
+  bool remoteMusicAvailable = receivedMicPresent && now - lastMusicLevelMs <= MUSIC_LEVEL_TIMEOUT_MS;
 
   uint32_t sumSpeed = 0;
   int speedCount = 0;
@@ -195,8 +318,16 @@ void loop() {
     uint8_t brightness = s.brightness;
     if (s.mode == BREATHING) brightness = beatsin8(40, 50, s.brightness);
     if (s.mode == MUSIC) {
-      uint8_t bpm = map(s.musicSensitivity, 0, 255, 20, 120);
-      brightness = beatsin8(bpm, 0, s.brightness);
+      if (remoteMusicAvailable) {
+        float normalized = (float)remoteMusicLevel / 255.0f;
+        float sensitivity = (float)s.musicSensitivity / 128.0f;
+        float level = sqrtf(normalized) * (float)s.brightness * sensitivity;
+        brightness = (uint8_t)constrain(level, 0.0f, 255.0f);
+        if (brightness < 3) brightness = 0;
+      } else {
+        uint8_t bpm = map(s.musicSensitivity, 0, 255, 20, 120);
+        brightness = beatsin8(bpm, 0, s.brightness);
+      }
     }
 
     int physicalOffset = 0;

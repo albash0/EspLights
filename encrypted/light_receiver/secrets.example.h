@@ -34,3 +34,15 @@ static const ControllerPeerConfig CONTROLLER_PEERS[] = {
 
 static const size_t CONTROLLER_PEER_COUNT =
   sizeof(CONTROLLER_PEERS) / sizeof(CONTROLLER_PEERS[0]);
+
+// Optional encrypted receiver A <-> receiver L music link.
+// Put receiver A's station MAC here, copy the same dedicated LMK into receiver
+// A's secrets.h, then change this to 1 on both receivers.
+#define RECEIVER_LINK_CONFIGURED 0
+static const uint8_t PRIMARY_RECEIVER_ADDRESS[6] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x0A
+};
+static const uint8_t RECEIVER_LINK_LMK[16] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A
+};

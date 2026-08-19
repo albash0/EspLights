@@ -40,12 +40,22 @@
 
 #define COMMAND_MAGIC 0xC041
 #define TELEMETRY_MAGIC 0xA17C
+#define MUSIC_LINK_MAGIC 0xE35A
+#define MUSIC_LINK_REQUEST 1
+#define MUSIC_LINK_LEVEL 2
+#define MUSIC_LINK_MIC_PRESENT 0x01
+#define MUSIC_STREAM_INTERVAL_MS 33
+#define MUSIC_REQUEST_TIMEOUT_MS 4000
 #define TELEMETRY_RADAR_CONNECTED 0x01
 #define TELEMETRY_AHT_CONNECTED   0x02
 #define TELEMETRY_PRESENCE        0x04
 #define RECEIVER_A 0
 #define RECEIVER_L 1
 #define RECEIVER_BOTH 2
+
+#ifndef RECEIVER_LINK_CONFIGURED
+  #define RECEIVER_LINK_CONFIGURED 0
+#endif
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 
@@ -81,6 +91,15 @@ struct __attribute__((packed)) TelemetryPacket {
   uint8_t flags;
 };
 
+struct __attribute__((packed)) MusicLinkPacket {
+  uint16_t magic;
+  uint32_t sessionId;
+  uint32_t sequence;
+  uint8_t messageType;
+  uint8_t value;
+  uint8_t flags;
+};
+
 CRGB leds[TOTAL_LEDS];
 float volumeAmplitude = 0.0f;
 float micEnvelope = 0.0f;
@@ -101,18 +120,28 @@ uint32_t lastRadarBaudChangeMs = 0;
 uint32_t radarBytesSeen = 0;
 uint32_t telemetrySessionId = 0;
 uint32_t nextTelemetrySequence = 1;
+uint32_t musicSessionId = 0;
+uint32_t nextMusicSequence = 1;
+volatile bool musicStreamRequested = false;
+volatile uint32_t lastMusicRequestMs = 0;
 
 struct ControllerReplayState {
   uint32_t sessionId;
   uint32_t lastSequence;
 };
 
+struct MusicReplayState {
+  uint32_t sessionId;
+  uint32_t lastSequence;
+};
+
 static_assert(CONTROLLER_PEER_COUNT > 0, "Configure at least one controller peer.");
 static_assert(
-  CONTROLLER_PEER_COUNT <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
-  "Too many encrypted controllers for this ESP-NOW build."
+  CONTROLLER_PEER_COUNT + RECEIVER_LINK_CONFIGURED <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
+  "Too many encrypted controller/receiver peers for this ESP-NOW build."
 );
 ControllerReplayState controllerReplayStates[CONTROLLER_PEER_COUNT] = {};
+MusicReplayState lightReceiverReplayState = {};
 
 #if USE_NEW_I2S
 i2s_chan_handle_t rx_chan = NULL;
@@ -126,6 +155,7 @@ void updateOptionalSensors();
 bool initAHT10();
 bool readAHT10(float &temperature, float &humidity);
 void sendTelemetry();
+void serviceMusicStream();
 uint32_t newSessionId();
 int findControllerPeer(const uint8_t *address);
 
@@ -144,6 +174,30 @@ void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingDa
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   const uint8_t *sourceAddress = mac;
 #endif
+#if RECEIVER_LINK_CONFIGURED
+  if (sourceAddress != nullptr && memcmp(sourceAddress, LIGHT_RECEIVER_ADDRESS, 6) == 0) {
+    if (len != sizeof(MusicLinkPacket)) return;
+    MusicLinkPacket packet;
+    memcpy(&packet, incomingData, sizeof(packet));
+    if (packet.magic != MUSIC_LINK_MAGIC ||
+        packet.messageType != MUSIC_LINK_REQUEST ||
+        packet.sessionId == 0) return;
+
+    if (packet.sessionId != lightReceiverReplayState.sessionId) {
+      lightReceiverReplayState.sessionId = packet.sessionId;
+      lightReceiverReplayState.lastSequence = 0;
+    }
+    if (packet.sequence == 0 || packet.sequence <= lightReceiverReplayState.lastSequence) {
+      Serial.println("Dropped duplicate/replayed music request from receiver L.");
+      return;
+    }
+    lightReceiverReplayState.lastSequence = packet.sequence;
+    musicStreamRequested = packet.value != 0;
+    lastMusicRequestMs = millis();
+    return;
+  }
+#endif
+
   int controllerIndex = findControllerPeer(sourceAddress);
   if (controllerIndex < 0) return;
   if (len != sizeof(ESPNowPacket)) return;
@@ -193,6 +247,7 @@ void setup() {
   Serial.println("Booting receiver...");
 
   telemetrySessionId = newSessionId();
+  musicSessionId = newSessionId();
 
   pinMode(I2S_LR, OUTPUT);
   digitalWrite(I2S_LR, LOW);   // must match I2S_STD_SLOT_LEFT below
@@ -224,6 +279,21 @@ void setup() {
         Serial.printf("Failed to register encrypted controller peer %u!\n", (unsigned)(i + 1));
       }
     }
+#if RECEIVER_LINK_CONFIGURED
+    esp_now_peer_info_t lightReceiverPeer = {};
+    memcpy(lightReceiverPeer.peer_addr, LIGHT_RECEIVER_ADDRESS, 6);
+    lightReceiverPeer.channel = 1;
+    lightReceiverPeer.ifidx = WIFI_IF_STA;
+    lightReceiverPeer.encrypt = true;
+    memcpy(lightReceiverPeer.lmk, RECEIVER_LINK_LMK, sizeof(lightReceiverPeer.lmk));
+    if (esp_now_add_peer(&lightReceiverPeer) != ESP_OK) {
+      Serial.println("Failed to register encrypted receiver L music peer.");
+    } else {
+      Serial.println("Receiver A-to-L encrypted music link enabled.");
+    }
+#else
+    Serial.println("Receiver A-to-L music link not configured.");
+#endif
     Serial.printf("Configured %u encrypted controller peer(s).\n", (unsigned)CONTROLLER_PEER_COUNT);
   }
 }
@@ -237,6 +307,7 @@ uint32_t newSessionId() {
 void loop() {
   updateOptionalSensors();
   readMic();
+  serviceMusicStream();
   renderLEDs();
 
   static unsigned long lastHeartbeat = 0;
@@ -352,6 +423,35 @@ void sendTelemetry() {
   for (size_t i = 0; i < CONTROLLER_PEER_COUNT; i++) {
     esp_now_send(CONTROLLER_PEERS[i].address, (uint8_t *)&packet, sizeof(packet));
   }
+}
+
+void serviceMusicStream() {
+#if RECEIVER_LINK_CONFIGURED
+  uint32_t now = millis();
+  if (musicStreamRequested && now - lastMusicRequestMs > MUSIC_REQUEST_TIMEOUT_MS) {
+    musicStreamRequested = false;
+    Serial.println("Receiver L music request expired; stopping stream.");
+  }
+  if (!musicStreamRequested) return;
+
+  static uint32_t lastMusicSendMs = 0;
+  if (now - lastMusicSendMs < MUSIC_STREAM_INTERVAL_MS) return;
+  lastMusicSendMs = now;
+
+  MusicLinkPacket packet = {};
+  packet.magic = MUSIC_LINK_MAGIC;
+  packet.sessionId = musicSessionId;
+  packet.sequence = nextMusicSequence++;
+  packet.messageType = MUSIC_LINK_LEVEL;
+  packet.value = micPresent ? (uint8_t)roundf(constrain(volumeAmplitude, 0.0f, 1.0f) * 255.0f) : 0;
+  if (micPresent) packet.flags |= MUSIC_LINK_MIC_PRESENT;
+
+  if (nextMusicSequence == 0) {
+    musicSessionId = newSessionId();
+    nextMusicSequence = 1;
+  }
+  esp_now_send(LIGHT_RECEIVER_ADDRESS, (uint8_t *)&packet, sizeof(packet));
+#endif
 }
 
 void initI2S() {

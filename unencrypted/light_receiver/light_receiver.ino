@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 #include <FastLED.h>
 #include <esp_arduino_version.h>
 
@@ -17,6 +18,12 @@
 #define RECEIVER_A      0
 #define RECEIVER_L      1
 #define RECEIVER_BOTH   2
+#define MUSIC_LINK_MAGIC 0xE35A
+#define MUSIC_LINK_REQUEST 1
+#define MUSIC_LINK_LEVEL 2
+#define MUSIC_LINK_MIC_PRESENT 0x01
+#define MUSIC_REQUEST_INTERVAL_MS 1500
+#define MUSIC_LEVEL_TIMEOUT_MS 500
 
 enum LightMode { OFF, STABLE, RAINBOW, BREATHING, MUSIC };
 
@@ -47,10 +54,71 @@ struct __attribute__((packed)) ESPNowPacket {
   uint8_t automaticLights;
 };
 
+struct __attribute__((packed)) MusicLinkPacket {
+  uint16_t magic;
+  uint32_t sessionId;
+  uint32_t sequence;
+  uint8_t messageType;
+  uint8_t value;
+  uint8_t flags;
+};
+
 ZoneSettings zones[NUM_ZONES];
 CRGB leds[TOTAL_LEDS];
 uint8_t zoneFade[NUM_ZONES] = {0, 0, 0};
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint32_t musicSessionId = 0;
+uint32_t nextMusicRequestSequence = 1;
+uint32_t primaryReceiverSessionId = 0;
+uint32_t lastPrimaryReceiverSequence = 0;
+volatile bool musicRequested = false;
+volatile bool musicRequestDirty = false;
+volatile uint8_t receivedMusicLevel = 0;
+volatile bool receivedMicPresent = false;
+volatile uint32_t lastMusicLevelMs = 0;
+
+uint32_t newSessionId() {
+  uint32_t id = 0;
+  while (id == 0) id = esp_random();
+  return id;
+}
+
+bool anyZoneUsesMusic() {
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].mode == MUSIC) return true;
+  }
+  return false;
+}
+
+void updateMusicRequestState() {
+  bool requested = anyZoneUsesMusic();
+  if (requested != musicRequested) {
+    musicRequested = requested;
+    musicRequestDirty = true;
+  }
+}
+
+void serviceMusicRequest() {
+  uint32_t now = millis();
+  bool sendNow = musicRequestDirty;
+  if (sendNow) musicRequestDirty = false;
+
+  static uint32_t lastRequestMs = 0;
+  if (!sendNow && (!musicRequested || now - lastRequestMs < MUSIC_REQUEST_INTERVAL_MS)) return;
+  lastRequestMs = now;
+
+  MusicLinkPacket packet = {};
+  packet.magic = MUSIC_LINK_MAGIC;
+  packet.sessionId = musicSessionId;
+  packet.sequence = nextMusicRequestSequence++;
+  packet.messageType = MUSIC_LINK_REQUEST;
+  packet.value = musicRequested ? 1 : 0;
+  if (nextMusicRequestSequence == 0) {
+    musicSessionId = newSessionId();
+    nextMusicRequestSequence = 1;
+  }
+  esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
+}
 
 void applyPacket(const ESPNowPacket &packet) {
   if (packet.mode > MUSIC) return;
@@ -72,6 +140,7 @@ void applyPacket(const ESPNowPacket &packet) {
   } else if (packet.targetZone == NUM_ZONES) {
     for (int i = 0; i < NUM_ZONES; i++) applyToZone(zones[i]);
   }
+  updateMusicRequestState();
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -79,6 +148,28 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData
 #else
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 #endif
+  if (len == sizeof(MusicLinkPacket)) {
+    MusicLinkPacket musicPacket;
+    memcpy(&musicPacket, incomingData, sizeof(musicPacket));
+    if (musicPacket.magic == MUSIC_LINK_MAGIC &&
+        musicPacket.messageType == MUSIC_LINK_LEVEL &&
+        musicPacket.sessionId != 0) {
+      if (musicPacket.sessionId != primaryReceiverSessionId) {
+        primaryReceiverSessionId = musicPacket.sessionId;
+        lastPrimaryReceiverSequence = 0;
+      }
+      if (musicPacket.sequence == 0 || musicPacket.sequence <= lastPrimaryReceiverSequence) {
+        Serial.println("Dropped duplicate/replayed music level from receiver A.");
+        return;
+      }
+      lastPrimaryReceiverSequence = musicPacket.sequence;
+      receivedMusicLevel = musicPacket.value;
+      receivedMicPresent = (musicPacket.flags & MUSIC_LINK_MIC_PRESENT) != 0;
+      lastMusicLevelMs = millis();
+      return;
+    }
+  }
+
   if (len != sizeof(ESPNowPacket)) return;
   ESPNowPacket packet;
   memcpy(&packet, incomingData, sizeof(packet));
@@ -90,6 +181,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("Booting light-only receiver L...");
+  musicSessionId = newSessionId();
 
   FastLED.addLeds<LED_CHIPSET, LED_PIN, LED_COLOR_ORDER>(leds, TOTAL_LEDS)
     .setCorrection(TypicalLEDStrip);
@@ -118,6 +210,10 @@ void loop() {
   static uint8_t hue = 0;
   static unsigned long lastHueMs = 0;
   unsigned long now = millis();
+  serviceMusicRequest();
+
+  uint8_t remoteMusicLevel = receivedMusicLevel;
+  bool remoteMusicAvailable = receivedMicPresent && now - lastMusicLevelMs <= MUSIC_LEVEL_TIMEOUT_MS;
 
   uint32_t sumSpeed = 0;
   int speedCount = 0;
@@ -145,8 +241,16 @@ void loop() {
     uint8_t brightness = s.brightness;
     if (s.mode == BREATHING) brightness = beatsin8(40, 50, s.brightness);
     if (s.mode == MUSIC) {
-      uint8_t bpm = map(s.musicSensitivity, 0, 255, 20, 120);
-      brightness = beatsin8(bpm, 0, s.brightness);
+      if (remoteMusicAvailable) {
+        float normalized = (float)remoteMusicLevel / 255.0f;
+        float sensitivity = (float)s.musicSensitivity / 128.0f;
+        float level = sqrtf(normalized) * (float)s.brightness * sensitivity;
+        brightness = (uint8_t)constrain(level, 0.0f, 255.0f);
+        if (brightness < 3) brightness = 0;
+      } else {
+        uint8_t bpm = map(s.musicSensitivity, 0, 255, 20, 120);
+        brightness = beatsin8(bpm, 0, s.brightness);
+      }
     }
 
     int physicalOffset = 0;

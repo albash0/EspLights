@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 #include <FastLED.h>
 #include <esp_arduino_version.h>
 #include <Wire.h>
@@ -37,6 +38,12 @@
 #define AHT10_ADDRESS   0x38
 
 #define TELEMETRY_MAGIC 0xA17C
+#define MUSIC_LINK_MAGIC 0xE35A
+#define MUSIC_LINK_REQUEST 1
+#define MUSIC_LINK_LEVEL 2
+#define MUSIC_LINK_MIC_PRESENT 0x01
+#define MUSIC_STREAM_INTERVAL_MS 33
+#define MUSIC_REQUEST_TIMEOUT_MS 4000
 #define TELEMETRY_RADAR_CONNECTED 0x01
 #define TELEMETRY_AHT_CONNECTED   0x02
 #define TELEMETRY_PRESENCE        0x04
@@ -74,6 +81,15 @@ struct __attribute__((packed)) TelemetryPacket {
   uint8_t flags;
 };
 
+struct __attribute__((packed)) MusicLinkPacket {
+  uint16_t magic;
+  uint32_t sessionId;
+  uint32_t sequence;
+  uint8_t messageType;
+  uint8_t value;
+  uint8_t flags;
+};
+
 CRGB leds[TOTAL_LEDS];
 float volumeAmplitude = 0.0f;
 float micEnvelope = 0.0f;
@@ -92,6 +108,12 @@ uint8_t radarBaudIndex = 0;
 uint32_t lastRadarFrameMs = 0;
 uint32_t lastRadarBaudChangeMs = 0;
 uint32_t radarBytesSeen = 0;
+uint32_t musicSessionId = 0;
+uint32_t nextMusicSequence = 1;
+volatile bool musicStreamRequested = false;
+volatile uint32_t lastMusicRequestMs = 0;
+uint32_t lightReceiverSessionId = 0;
+uint32_t lastLightReceiverSequence = 0;
 
 #if USE_NEW_I2S
 i2s_chan_handle_t rx_chan = NULL;
@@ -105,13 +127,36 @@ void updateOptionalSensors();
 bool initAHT10();
 bool readAHT10(float &temperature, float &humidity);
 void sendTelemetry();
+void serviceMusicStream();
+uint32_t newSessionId();
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void OnDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *incomingData, int len) {
 #else
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 #endif
-  if (len < sizeof(ESPNowPacket)) return;
+  if (len == sizeof(MusicLinkPacket)) {
+    MusicLinkPacket musicPacket;
+    memcpy(&musicPacket, incomingData, sizeof(musicPacket));
+    if (musicPacket.magic == MUSIC_LINK_MAGIC &&
+        musicPacket.messageType == MUSIC_LINK_REQUEST &&
+        musicPacket.sessionId != 0) {
+      if (musicPacket.sessionId != lightReceiverSessionId) {
+        lightReceiverSessionId = musicPacket.sessionId;
+        lastLightReceiverSequence = 0;
+      }
+      if (musicPacket.sequence == 0 || musicPacket.sequence <= lastLightReceiverSequence) {
+        Serial.println("Dropped duplicate/replayed music request from receiver L.");
+        return;
+      }
+      lastLightReceiverSequence = musicPacket.sequence;
+      musicStreamRequested = musicPacket.value != 0;
+      lastMusicRequestMs = millis();
+      return;
+    }
+  }
+
+  if (len != sizeof(ESPNowPacket)) return;
   ESPNowPacket packet; memcpy(&packet, incomingData, sizeof(ESPNowPacket));
   if (packet.targetReceiver != RECEIVER_A && packet.targetReceiver != RECEIVER_BOTH) return;
   automaticLights = packet.automaticLights != 0;
@@ -145,6 +190,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("Booting receiver...");
+  musicSessionId = newSessionId();
 
   pinMode(I2S_LR, OUTPUT);
   digitalWrite(I2S_LR, LOW);   // must match I2S_STD_SLOT_LEFT below
@@ -156,7 +202,9 @@ void setup() {
   FastLED.addLeds<LED_CHIPSET, LED_PIN, LED_COLOR_ORDER>(leds, TOTAL_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setMaxPowerInVoltsAndMilliamps(12, 2000);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
   if (esp_now_init() == ESP_OK) {
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_now_register_recv_cb(OnDataRecv);
 
     esp_now_peer_info_t peerInfo = {};
@@ -170,6 +218,7 @@ void setup() {
 void loop() {
   updateOptionalSensors();
   readMic();
+  serviceMusicStream();
   renderLEDs();
   
   static unsigned long lastHeartbeat = 0;
@@ -177,6 +226,12 @@ void loop() {
     lastHeartbeat = millis();
     sendTelemetry();
   }
+}
+
+uint32_t newSessionId() {
+  uint32_t id = 0;
+  while (id == 0) id = esp_random();
+  return id;
 }
 
 void initOptionalSensors() {
@@ -276,6 +331,33 @@ void sendTelemetry() {
   if (radarConnected) packet.flags |= TELEMETRY_RADAR_CONNECTED;
   if (ahtConnected) packet.flags |= TELEMETRY_AHT_CONNECTED;
   if (presenceDetected) packet.flags |= TELEMETRY_PRESENCE;
+  esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
+}
+
+void serviceMusicStream() {
+  uint32_t now = millis();
+  if (musicStreamRequested && now - lastMusicRequestMs > MUSIC_REQUEST_TIMEOUT_MS) {
+    musicStreamRequested = false;
+    Serial.println("Receiver L music request expired; stopping stream.");
+  }
+  if (!musicStreamRequested) return;
+
+  static uint32_t lastMusicSendMs = 0;
+  if (now - lastMusicSendMs < MUSIC_STREAM_INTERVAL_MS) return;
+  lastMusicSendMs = now;
+
+  MusicLinkPacket packet = {};
+  packet.magic = MUSIC_LINK_MAGIC;
+  packet.sessionId = musicSessionId;
+  packet.sequence = nextMusicSequence++;
+  packet.messageType = MUSIC_LINK_LEVEL;
+  packet.value = micPresent ? (uint8_t)roundf(constrain(volumeAmplitude, 0.0f, 1.0f) * 255.0f) : 0;
+  if (micPresent) packet.flags |= MUSIC_LINK_MIC_PRESENT;
+
+  if (nextMusicSequence == 0) {
+    musicSessionId = newSessionId();
+    nextMusicSequence = 1;
+  }
   esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
 }
 
