@@ -19,7 +19,7 @@
 #endif
 
 #define NUM_ZONES       3
-#define ZONE_MAX_LEDS   15
+#define ZONE_MAX_LEDS   33
 #define TOTAL_LEDS      (NUM_ZONES * ZONE_MAX_LEDS)
 #define LED_PIN         5
 #define LED_CHIPSET     WS2811
